@@ -7,7 +7,6 @@ from __future__ import print_function
 from cpython.ref cimport PyObject, Py_INCREF
 from cpython.bytes cimport PyBytes_FromStringAndSize
 from cpython.mem cimport PyMem_Free
-from cython.operator cimport dereference as deref
 from libc.stddef cimport wchar_t
 
 import numpy as np
@@ -16,8 +15,6 @@ cimport numpy as np
 np.import_array()
 
 import os
-import sys
-import warnings
 from enum import Enum
 
 cdef extern from "Python.h":
@@ -890,6 +887,7 @@ cdef class RawPy:
     cdef apply_params(self, params):
         if params is None:
             return
+
         cdef libraw_output_params_t* p = &self.p.imgdata.params
         p.user_qual = params.user_qual
         p.half_size = params.half_size
@@ -901,10 +899,19 @@ cdef class RawPy:
         p.med_passes = params.med_passes
         p.use_camera_wb = params.use_camera_wb
         p.use_auto_wb = params.use_auto_wb
+
         if params.user_mul:
             for i in range(4):
                 p.user_mul[i] = params.user_mul[i]
+
+        if params.output_profile:
+            p.output_profile = params.output_profile
+
         p.output_color = params.output_color
+
+        if params.camera_profile:
+            p.camera_profile = params.camera_profile
+
         p.output_bps = params.output_bps
         p.user_flip = params.user_flip
         p.user_black = params.user_black
@@ -918,10 +925,14 @@ cdef class RawPy:
         p.exp_correc = params.exp_correc
         p.exp_shift = params.exp_shift
         p.exp_preser = params.exp_preser
+
         if params.bad_pixels:
             p.bad_pixels = params.bad_pixels
         else:
             p.bad_pixels = NULL
+
+        p.output_tiff = int(params.output_tiff)
+
         p.gamm[0] = params.gamm[0]
         p.gamm[1] = params.gamm[1]
         p.aber[0] = params.aber[0]
@@ -1061,13 +1072,13 @@ class Params(object):
                  fbdd_noise_reduction=FBDDNoiseReductionMode.Off,
                  noise_thr=None, median_filter_passes=0,
                  use_camera_wb=False, use_auto_wb=False, user_wb=None,
-                 output_color=ColorSpace.sRGB, output_bps=8, 
+                 output_color=ColorSpace.sRGB, output_profile: str = None, camera_profile: str = None, output_bps=8,
                  user_flip=None, user_black=None, user_sat=None,
                  no_auto_bright=False, auto_bright_thr=None, adjust_maximum_thr=0.75,
                  bright=1.0, highlight_mode=HighlightMode.Clip,
                  exp_shift=None, exp_preserve_highlights=0.0, no_auto_scale=False,
                  gamma=None, chromatic_aberration=None,
-                 bad_pixels_path=None):
+                 bad_pixels_path=None, output_tiff: bool = False):
         """
 
         If use_camera_wb and use_auto_wb are False and user_wb is None, then
@@ -1087,6 +1098,9 @@ class Params(object):
         :param bool use_auto_wb: whether to try automatically calculating the white balance 
         :param list user_wb: list of length 4 with white balance multipliers for each color 
         :param rawpy.ColorSpace output_color: output color space
+        :param str output_profile: Path to output profile ICC file (used only if LibRaw compiled with LCMS support)
+        :param str camera_profile: Path to input (camera) profile ICC file (or 'embed' for embedded profile). Used only
+                                   if LCMS support compiled in.
         :param int output_bps: 8 or 16
         :param int user_flip: 0=none, 3=180, 5=90CCW, 6=90CW,
                               default is to use image orientation from the RAW image if available
@@ -1110,6 +1124,7 @@ class Params(object):
         :param str bad_pixels_path: path to dcraw bad pixels file. Each bad pixel will be corrected using
                                     the mean of the neighbor pixels. See the :mod:`rawpy.enhance` module
                                     for alternative repair algorithms, e.g. using the median.
+        :param bool output_tiff: False/True: output PPM/TIFF.
         """
 
         if demosaic_algorithm:
@@ -1117,6 +1132,7 @@ class Params(object):
             self.user_qual = demosaic_algorithm.value
         else:
             self.user_qual = -1
+
         self.half_size = half_size
         self.four_color_rgb = four_color_rgb
         self.dcb_iterations = dcb_iterations
@@ -1126,11 +1142,23 @@ class Params(object):
         self.med_passes = median_filter_passes
         self.use_camera_wb = use_camera_wb
         self.use_auto_wb = use_auto_wb
+
         if user_wb is not None:
             assert len(user_wb) == 4
             self.user_mul = user_wb
         else:
-            self.user_mul = [0,0,0,0] 
+            self.user_mul = [0,0,0,0]
+
+        if output_profile:
+            self.output_profile = output_profile.encode()
+        else:
+            self.output_profile = None
+
+        if camera_profile:
+            self.camera_profile = camera_profile.encode()
+        else:
+            self.camera_profile = None
+
         self.output_color = output_color.value
         self.output_bps = output_bps
         self.user_flip = user_flip if user_flip is not None else -1
@@ -1138,38 +1166,49 @@ class Params(object):
         self.user_sat = user_sat if user_sat is not None else -1
         self.no_auto_bright = no_auto_bright
         self.no_auto_scale = no_auto_scale
+
         if auto_bright_thr is not None:
             min_version = (0,16,1)
+
             if libraw_version < min_version:
                 # see https://github.com/LibRaw/LibRaw/commit/ea70421a518ba5a039fcc1dc1045b428159fb032
                 raise NotSupportedError('Parameter auto_bright_thr', min_version)
+
             self.auto_bright_thr = auto_bright_thr
         else:
             self.auto_bright_thr = LIBRAW_DEFAULT_AUTO_BRIGHTNESS_THRESHOLD
+
         self.adjust_maximum_thr = adjust_maximum_thr
         self.bright = bright
+
         if isinstance(highlight_mode, HighlightMode):
             self.highlight = highlight_mode.value
         else:
             self.highlight = highlight_mode
+
         if exp_shift is not None:
             self.exp_correc = 1
             self.exp_shift = exp_shift
         else:
             self.exp_correc = -1
             self.exp_shift = 1.0
+
         self.exp_preser = exp_preserve_highlights
+
         if gamma is not None:
             assert len(gamma) == 2
             self.gamm = (1/gamma[0], gamma[1])
         else:
             self.gamm = (1/2.222, 4.5) # rec. BT.709
+
         if chromatic_aberration is not None:
             assert len(chromatic_aberration) == 2
             self.aber = (chromatic_aberration[0], chromatic_aberration[1])
         else:
             self.aber = (1, 1)
-        self.bad_pixels = bad_pixels_path            
+
+        self.bad_pixels = bad_pixels_path
+        self.output_tiff = output_tiff
     
 cdef class processed_image_wrapper:
     cdef RawPy raw
